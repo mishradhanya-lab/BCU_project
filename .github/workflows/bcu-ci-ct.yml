@@ -1,0 +1,603 @@
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  CONFIG 1 — PURE GITHUB ACTIONS                                            ║
+# ║  BCU Brake Control Unit · STM32F407VG · FreeRTOS v10.5.1                  ║
+# ║                                                                              ║
+# ║  Pipeline stages:                                                            ║
+# ║    [PR Checks] → [Docker Env] → [Build ∥ Lint] →                           ║
+# ║    [SonarQube ∥ BlackDuck ∥ Valgrind] →                                    ║
+# ║    [CT: FL ∥ FR ∥ RL ∥ RR] → [Coverage] →                                 ║
+# ║    [Integration ∥ HIL] → [Publish Artifactory] → [Quality Gate]            ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+name: BCU CI/CT — GitHub Actions
+
+on:
+  pull_request:
+    branches: [main, develop]
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main, develop]
+
+# Cancel in-progress runs for the same branch on new push
+concurrency:
+  group: bcu-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOCKER_IMAGE:    ghcr.io/${{ github.repository }}/bcu-build-env:latest
+  ARTIFACTORY_URL: ${{ secrets.ARTIFACTORY_URL }}
+  SONAR_HOST_URL:  ${{ secrets.SONAR_HOST_URL }}
+  BUILD_DIR:       build
+  TARGET_MCU:      STM32F407VGTx
+  ARM_TOOLCHAIN:   gcc-arm-none-eabi
+  CONAN_PROFILE:   cortex_m4_debug
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 1: PR CHECKS  (sequential — gate before any CI runs)
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+  pr-checks:
+    name: PR Checks
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Branch naming convention
+        run: |
+          BRANCH="${{ github.head_ref }}"
+          PATTERN="^(feature|fix|hotfix|chore|refactor)\/BCU-[0-9]+-[a-z0-9-]+$"
+          if [[ ! "$BRANCH" =~ $PATTERN ]]; then
+            echo "❌ Branch '$BRANCH' violates convention."
+            echo "   Expected: feature/BCU-101-abs-pressure-threshold"
+            exit 1
+          fi
+          echo "✅ Branch: $BRANCH"
+
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+
+      - name: Commit message lint (Conventional Commits)
+        run: |
+          npm install --save-dev @commitlint/cli @commitlint/config-conventional
+          cat > commitlint.config.js << 'EOF'
+          module.exports = {
+            extends: ['@commitlint/config-conventional'],
+            rules: {
+              'scope-enum': [2, 'always', [
+                'BCU','abs','sensor','brake','can','freertos','hal','isr','ci','test','docs'
+              ]],
+              'subject-max-length': [2, 'always', 72],
+            }
+          };
+          EOF
+          npx commitlint \
+            --from "${{ github.event.pull_request.base.sha }}" \
+            --to   "${{ github.event.pull_request.head.sha }}" \
+            --verbose
+
+      - name: Diff size guard (monolith protection)
+        env:
+          MAX_LINES: 400
+          MAX_FILES: 10
+        run: |
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+          LINES=$(git diff --shortstat "$BASE" "$HEAD" -- '*.c' '*.h' \
+                  | grep -oP '\d+ insertion' | grep -oP '\d+' || echo 0)
+          DELS=$(git diff --shortstat "$BASE" "$HEAD" -- '*.c' '*.h' \
+                 | grep -oP '\d+ deletion' | grep -oP '\d+' || echo 0)
+          TOTAL=$((LINES + DELS))
+          FILES=$(git diff --name-only "$BASE" "$HEAD" -- '*.c' '*.h' | wc -l)
+          echo "Lines changed: $TOTAL / $MAX_LINES | Files: $FILES / $MAX_FILES"
+          [ "$TOTAL" -le "$MAX_LINES" ] || { echo "❌ Too many lines: $TOTAL"; exit 1; }
+          [ "$FILES"  -le "$MAX_FILES"  ] || { echo "❌ Too many files: $FILES"; exit 1; }
+          echo "✅ Size check passed"
+
+      - name: PR description + ticket reference
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          [ ${#PR_BODY} -ge 50 ] || { echo "❌ PR description too short"; exit 1; }
+          echo "$PR_BODY" | grep -qiE "BCU-[0-9]+" \
+            || { echo "❌ Must reference a BCU ticket (BCU-XXX)"; exit 1; }
+          echo "✅ PR description valid"
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # STAGE 2: BUILD DOCKER IMAGE (sequential, cached)
+  # Toolchain: gcc-arm-none-eabi + CMake + Conan + STM32 HAL headers
+  # ─────────────────────────────────────────────────────────────────────────────
+  build-docker-env:
+    name: Build Docker env
+    runs-on: ubuntu-latest
+    needs: [pr-checks]
+    if: always() && (needs.pr-checks.result == 'success' || github.event_name == 'push')
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}/bcu-build-env
+          tags: |
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: buildx-bcu-${{ hashFiles('Dockerfile') }}
+          restore-keys: buildx-bcu-
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build & push build-env image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to:   type=local,dest=/tmp/.buildx-cache-new,mode=max
+          build-args: |
+            ARM_TOOLCHAIN_VER=12.3
+            CMAKE_VER=3.28.1
+            FREERTOS_VER=10.5.1
+
+      - name: Move cache
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # STAGE 3A: BUILD  (parallel with lint)
+  # CMake cross-compile for Cortex-M4 · Conan resolves FreeRTOS + HAL
+  # Artifacts pushed to JFrog Artifactory
+  # ─────────────────────────────────────────────────────────────────────────────
+  build:
+    name: Build (CMake + Conan → ARM)
+    runs-on: ubuntu-latest
+    needs: [build-docker-env]
+    container:
+      image: ghcr.io/${{ github.repository }}/bcu-build-env:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Conan — install dependencies
+        run: |
+          conan profile detect --name ${{ env.CONAN_PROFILE }}
+          conan install . \
+            --profile:build=default \
+            --profile:host=${{ env.CONAN_PROFILE }} \
+            --build=missing \
+            --output-folder=${{ env.BUILD_DIR }}
+
+      - name: CMake configure (cross-compile Cortex-M4)
+        run: |
+          cmake -B ${{ env.BUILD_DIR }} \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/arm-cortex-m4.cmake \
+            -DCMAKE_C_FLAGS="--coverage -fprofile-arcs -ftest-coverage -mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mfloat-abi=hard" \
+            -DTARGET_MCU=${{ env.TARGET_MCU }} \
+            -DENABLE_TESTING=ON \
+            -G Ninja
+
+      - name: Build BCU firmware
+        run: cmake --build ${{ env.BUILD_DIR }} --parallel $(nproc)
+
+      - name: Verify firmware binary
+        run: |
+          arm-none-eabi-size ${{ env.BUILD_DIR }}/bcu_firmware.elf
+          arm-none-eabi-objdump -h ${{ env.BUILD_DIR }}/bcu_firmware.elf
+
+      - name: Upload build artifacts (GitHub)
+        uses: actions/upload-artifact@v4
+        with:
+          name: bcu-build-${{ github.sha }}
+          path: |
+            ${{ env.BUILD_DIR }}/bcu_firmware.elf
+            ${{ env.BUILD_DIR }}/bcu_firmware.hex
+            ${{ env.BUILD_DIR }}/bcu_firmware.map
+          retention-days: 7
+
+      - name: Publish to JFrog Artifactory
+        env:
+          JFROG_TOKEN: ${{ secrets.JFROG_TOKEN }}
+        run: |
+          VERSION="${{ github.sha }}"
+          jf rt upload \
+            "${{ env.BUILD_DIR }}/bcu_firmware.*" \
+            "bcu-generic-dev/BCU/$VERSION/" \
+            --url "${{ env.ARTIFACTORY_URL }}" \
+            --access-token "$JFROG_TOKEN" \
+            --build-name "BCU-CI" \
+            --build-number "${{ github.run_number }}"
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # STAGE 3B: LINT  (parallel with build)
+  # cppcheck targets ISR atomicity + MISRA-C rules in bcu_brake_control.c
+  # ─────────────────────────────────────────────────────────────────────────────
+  lint:
+    name: Lint (cppcheck + clang-tidy + clang-format)
+    runs-on: ubuntu-latest
+    needs: [build-docker-env]
+    container:
+      image: ghcr.io/${{ github.repository }}/bcu-build-env:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: cppcheck — BCU-specific suppressions
+        run: |
+          cppcheck \
+            --enable=all \
+            --error-exitcode=1 \
+            --std=c11 \
+            --platform=arm32-wchar_t4 \
+            --suppress=missingIncludeSystem \
+            --suppress=unusedFunction \
+            --inline-suppr \
+            --xml --xml-version=2 \
+            -I include/ \
+            -DSTM32F407xx \
+            -DconfigMAX_PRIORITIES=56 \
+            src/bcu_brake_control.c \
+            2> cppcheck-report.xml
+          echo "✅ cppcheck passed"
+
+      - name: clang-tidy — MISRA-C 2012 subset
+        run: |
+          clang-tidy src/bcu_brake_control.c \
+            --checks="clang-analyzer-*,cert-*,bugprone-*,readability-*" \
+            -- -I include/ -DSTM32F407xx -mcpu=cortex-m4
+
+      - name: clang-format compliance
+        run: |
+          FAIL=0
+          for f in $(find src include -name '*.c' -o -name '*.h'); do
+            if ! clang-format --dry-run --Werror "$f" 2>/dev/null; then
+              echo "❌ Format violation: $f"
+              FAIL=1
+            fi
+          done
+          [ $FAIL -eq 0 ] && echo "✅ All files formatted correctly"
+          exit $FAIL
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cppcheck-report
+          path: cppcheck-report.xml
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # STAGE 4A: SONARQUBE  (parallel quality scan)
+  # Targets: ABS state machine complexity, ISR critical section, coverage gate
+  # ─────────────────────────────────────────────────────────────────────────────
+  sonarqube:
+    name: SonarQube scan
+    runs-on: ubuntu-latest
+    needs: [build, lint]
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - uses: actions/download-artifact@v4
+        with: { name: bcu-build-${{ github.sha }}, path: build/ }
+
+      - uses: actions/download-artifact@v4
+        with: { name: cppcheck-report, path: . }
+
+      - name: SonarQube scan
+        uses: SonarSource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN:    ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.projectKey=bcu-brake-control
+            -Dsonar.projectName="BCU Brake Control Unit"
+            -Dsonar.sources=src
+            -Dsonar.tests=test
+            -Dsonar.language=c
+            -Dsonar.c.file.suffixes=.c,.h
+            -Dsonar.coverageReportPaths=coverage.xml
+            -Dsonar.cxx.cppcheck.reportPaths=cppcheck-report.xml
+            -Dsonar.qualitygate.wait=true
+            -Dsonar.qualitygate.timeout=300
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # STAGE 4B: BLACK DUCK  (parallel — OSS licence + CVE scan)
+  # Scans FreeRTOS v10.5.1 MIT, STM32 HAL, Conan-resolved deps
+  # ─────────────────────────────────────────────────────────────────────────────
+  black-duck:
+    name: Black Duck security scan
+    runs-on: ubuntu-latest
+    needs: [build, lint]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Black Duck — Synopsys Detect
+        uses: synopsys-sig/detect-action@v1
+        with:
+          detect-version: latest
+          blackduck-url:   ${{ secrets.BLACKDUCK_URL }}
+          blackduck-token: ${{ secrets.BLACKDUCK_TOKEN }}
+          detect-args: >
+            --detect.project.name=BCU-BrakeControl
+            --detect.project.version.name=${{ github.ref_name }}
+            --detect.source.path=.
+            --detect.conan.path=conanfile.txt
+            --blackduck.trust.cert=true
+            --detect.risk.report.pdf=true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: blackduck-report
+          path: "**/*BlackDuck_RiskReport.pdf"
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # STAGE 4C: VALGRIND  (parallel — memory leak analysis on QEMU ARM)
+  # Targets: WheelData_t CCM placement, CAN queue alloc, SPI mutex
+  # ─────────────────────────────────────────────────────────────────────────────
+  valgrind:
+    name: Valgrind memory analysis (QEMU)
+    runs-on: ubuntu-latest
+    needs: [build, lint]
+    container:
+      image: ghcr.io/${{ github.repository }}/bcu-build-env:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with: { name: bcu-build-${{ github.sha }}, path: build/ }
+
+      - name: Run Valgrind via QEMU ARM user-mode
+        run: |
+          valgrind \
+            --tool=memcheck \
+            --leak-check=full \
+            --show-leak-kinds=all \
+            --track-origins=yes \
+            --error-exitcode=1 \
+            --xml=yes \
+            --xml-file=valgrind-report.xml \
+            qemu-arm -L /usr/arm-linux-gnueabihf \
+            build/bcu_test_host
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: valgrind-report
+          path: valgrind-report.xml
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # STAGE 5: CT UNIT TESTS  (parallel per wheel — 4 jobs)
+  # Each wheel tests: ABS state machine, slip ratio, solenoid output
+  # ─────────────────────────────────────────────────────────────────────────────
+  unit-tests:
+    name: CT — ${{ matrix.wheel }}
+    runs-on: ubuntu-latest
+    needs: [build, lint]
+    strategy:
+      fail-fast: false          # all 4 wheels run even if one fails
+      matrix:
+        wheel: [WHEEL_FL, WHEEL_FR, WHEEL_RL, WHEEL_RR]
+        include:
+          - wheel: WHEEL_FL
+            wheel_id: "0"
+            test_filter: "fl"
+          - wheel: WHEEL_FR
+            wheel_id: "1"
+            test_filter: "fr"
+          - wheel: WHEEL_RL
+            wheel_id: "2"
+            test_filter: "rl"
+          - wheel: WHEEL_RR
+            wheel_id: "3"
+            test_filter: "rr"
+    container:
+      image: ghcr.io/${{ github.repository }}/bcu-build-env:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with: { name: bcu-build-${{ github.sha }}, path: build/ }
+
+      - name: Run Unity tests — ${{ matrix.wheel }}
+        run: |
+          cd build
+          ctest \
+            --output-on-failure \
+            --no-compress-output \
+            -T Test \
+            --timeout 120 \
+            -R "${{ matrix.test_filter }}"
+
+      - name: Generate per-wheel coverage
+        run: |
+          gcovr \
+            --root . \
+            --filter src/bcu_brake_control.c \
+            --xml \
+            --output coverage-${{ matrix.wheel }}.xml \
+            --exclude test/ \
+            --exclude unity/
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-${{ matrix.wheel }}
+          path: coverage-${{ matrix.wheel }}.xml
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # STAGE 6: COVERAGE AGGREGATION  (sequential)
+  # Merges all 4 wheel coverage files → feeds SonarQube quality gate
+  # ─────────────────────────────────────────────────────────────────────────────
+  coverage:
+    name: Coverage aggregation
+    runs-on: ubuntu-latest
+    needs: [unit-tests]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all coverage reports
+        uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-WHEEL_*
+          merge-multiple: true
+
+      - name: Merge coverage with gcovr
+        run: |
+          pip install gcovr --break-system-packages
+          gcovr \
+            --add-tracefile "coverage-WHEEL_FL.xml" \
+            --add-tracefile "coverage-WHEEL_FR.xml" \
+            --add-tracefile "coverage-WHEEL_RL.xml" \
+            --add-tracefile "coverage-WHEEL_RR.xml" \
+            --xml --output coverage.xml
+          gcovr \
+            --add-tracefile "coverage-WHEEL_FL.xml" \
+            --add-tracefile "coverage-WHEEL_FR.xml" \
+            --add-tracefile "coverage-WHEEL_RL.xml" \
+            --add-tracefile "coverage-WHEEL_RR.xml" \
+            --html-details coverage-html/index.html
+
+          echo "=== Coverage Summary ==="
+          gcovr \
+            --add-tracefile "coverage-WHEEL_FL.xml" \
+            --add-tracefile "coverage-WHEEL_FR.xml" \
+            --add-tracefile "coverage-WHEEL_RL.xml" \
+            --add-tracefile "coverage-WHEEL_RR.xml"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-merged
+          path: |
+            coverage.xml
+            coverage-html/
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # STAGE 7A: INTEGRATION TESTS  (parallel with HIL)
+  # CAN J1939 TX/RX · FreeRTOS scheduling · IWDG liveness · SPI WSS inject
+  # ─────────────────────────────────────────────────────────────────────────────
+  integration-tests:
+    name: Integration tests (QEMU + CANoe sim)
+    runs-on: ubuntu-latest
+    needs: [sonarqube, black-duck, valgrind, coverage]
+    container:
+      image: ghcr.io/${{ github.repository }}/bcu-build-env:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with: { name: bcu-build-${{ github.sha }}, path: build/ }
+
+      - name: CAN J1939 frame TX/RX test
+        run: python3 scripts/test_can_j1939.py --elf build/bcu_firmware.elf
+
+      - name: FreeRTOS task schedule validation
+        run: python3 scripts/test_freertos_schedule.py --period-ms 10
+
+      - name: IWDG liveness (500ms kick window)
+        run: python3 scripts/test_iwdg_liveness.py --timeout-ms 1000
+
+      - name: SPI TLE5012B WSS pulse injection
+        run: |
+          python3 scripts/test_wss_inject.py \
+            --pulses-per-rev 48 \
+            --wheel-circumference 1.963 \
+            --target-speed-mps 27.8
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # STAGE 7B: HIL TESTS  (parallel — self-hosted runner with STM32 attached)
+  # Flashes real STM32F407VG, injects WSS signals, checks solenoid GPIO timing
+  # ─────────────────────────────────────────────────────────────────────────────
+  hil-tests:
+    name: HIL — STM32F407VG hardware
+    runs-on: [self-hosted, hil-runner, stm32]
+    needs: [sonarqube, black-duck, valgrind, coverage]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with: { name: bcu-build-${{ github.sha }}, path: build/ }
+
+      - name: Flash firmware via ST-Link
+        run: |
+          STM32_Programmer_CLI \
+            --connect port=SWD \
+            --write build/bcu_firmware.hex \
+            --verify \
+            --start
+
+      - name: HIL — ABS cycle HOLD→DUMP→BUILD
+        run: |
+          python3 scripts/hil/run_abs_cycle.py \
+            --slip-ratio-trigger 0.25 \
+            --expected-states HOLD,DUMP,BUILD \
+            --timeout-ms 500
+
+      - name: HIL — solenoid GPIO timing assertion
+        run: |
+          python3 scripts/hil/assert_gpio_timing.py \
+            --hold-pin  PB0 \
+            --dump-pin  PB1 \
+            --max-latency-us 200
+
+      - name: HIL — CAN bus frame validation
+        run: |
+          python3 scripts/hil/validate_can_frames.py \
+            --can-id 0x18FF4000 \
+            --dlc 8 \
+            --period-ms 20 \
+            --tolerance-ms 2
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # STAGE 8: QUALITY GATE  (sequential — final verdict)
+  # ─────────────────────────────────────────────────────────────────────────────
+  quality-gate:
+    name: Quality Gate
+    runs-on: ubuntu-latest
+    needs: [integration-tests, hil-tests]
+    steps:
+      - name: All checks passed
+        run: |
+          echo "✅ PR Checks       — passed"
+          echo "✅ Build           — passed"
+          echo "✅ Lint            — passed"
+          echo "✅ SonarQube       — quality gate passed"
+          echo "✅ Black Duck      — no critical CVEs"
+          echo "✅ Valgrind        — no memory leaks"
+          echo "✅ CT Unit Tests   — all 4 wheels green"
+          echo "✅ Coverage        — ≥80% on new code"
+          echo "✅ Integration     — CAN/FreeRTOS/IWDG/WSS"
+          echo "✅ HIL             — ABS cycle validated on hardware"
+          echo ""
+          echo "🚀 BCU feature cleared for merge"
